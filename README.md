@@ -1,3 +1,1 @@
-### 575 project
-
-This repository contains R files/datasets/other supplementary material for my research project for PSYC575.
+Repository for R files/datasets/other supplementary material for PSYC575 research project
