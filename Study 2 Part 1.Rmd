@@ -1,0 +1,638 @@
+---
+title: "PSYC575 Study 2"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(MASS) # to draw from a bivariate normal dist
+library(dplyr) # for data wrangling
+library(lme4) # for lmer
+library(svMisc) # progress
+library(tictoc)
+```
+
+
+# Functions
+
+```{r}
+ # Function that computes the lower and upper bounds for a 95\% CI for a 
+ # proportion
+f_ci <- function(prop, niter) {
+  se <- sqrt(prop * (1 - prop) / niter)
+  ci <- c(prop - 1.96 * se , prop + 1.96 * se)
+  return(ci)
+}
+
+# Function to compute the proportions one fitted model outperformed the
+# other/ had the same performance / had worse performance for two sets of 
+# deviance values computed for data generated for two data generating models
+
+prop_dev <- function(devbw, devc, niter){
+  
+   bw_bw <- sum(devbw[,1] < devbw[,2]) / niter
+   bw_c <- sum(devbw[,1] > devbw[,2]) / niter
+   bw_eq <- sum(devbw[,1] == devbw[,2]) / niter
+   c_bw <- sum(devc[,1] < devc[,2]) / niter
+   c_c <- sum(devc[,1] > devc[,2]) / niter
+   c_eq <- sum(devc[,1] == devc[,2]) / niter
+   
+   # compute 95% CI for the proportions above
+   ci_bw_bw <- f_ci(bw_bw, niter)
+   ci_bw_c <- f_ci(bw_c, niter)
+   ci_c_c <- f_ci(c_c, niter)
+   ci_c_bw <- f_ci(c_bw, niter)
+   ci_bw_eq <- f_ci(bw_eq, niter)
+   ci_c_eq <- f_ci(c_eq, niter)
+   
+ df <- as.data.frame(
+       cbind(rbind("BW data: P(dev_bw < dev_c)" = round(bw_bw, 3), 
+                   "BW data: P(dev_c < dev_bw)"  = round(bw_c, 3), 
+                   "BW data: P(dev_bw == dev_c)" = round(bw_eq, 3),
+                   "C data: P(dev_bw < dev_c)" = round(c_bw, 3),
+                   "C data: P(dev_c < dev_bw)" = round(c_c, 3),
+                   "C data: P(dev_bw == dev_c)" = round(c_eq, 3)), 
+             rbind(round(ci_bw_bw, 3), 
+                   round(ci_bw_c, 3), 
+                   round(ci_bw_eq, 3),
+                   round(ci_c_bw, 3), 
+                   round(ci_c_c, 3),
+                  round(ci_c_eq, 3))))
+ colnames(df) <- c("p", "CI_lb", "CI_ub")
+ return(df)
+}
+```
+
+```{r}
+# Function to compute  ICC for a given model fit
+get_icc <- function(model_fit){
+  vc <- as.data.frame(VarCorr(model_fit))
+  return(round(c(vc$vcov[1] / (vc$vcov[1] + vc$vcov[2])), 3))
+}
+```
+
+```{r contextual-function-one-var}
+# Function to generate a data set with the contextual formulation, single 
+# binary predictor
+generate_c_data_single_var <- function(n_clusters, cluster_size, 
+                                       gamma00, gamma01, gamma10,
+                                       tau0sq, tau1sq, tau01, sigma2,
+                                       x2threshold, x2prob) {
+  
+N <- cluster_size * n_clusters # total number of observations 
+cluster <- rep(c(1:n_clusters), cluster_size) # assign observations to clusters
+
+# Randomly generate the probabilities that will be used to generate x1_ij:
+x2 <- rbinom(n_clusters, 1, x2prob) # assign clusters to membership 1 vs. 0 (x2)
+p_j <- vector(length = n_clusters) # initialize
+p_j[x2 == 1] <- runif(sum(x2), min = x2threshold, max = 1) # generate p_j based on x2
+p_j[x2 == 0] <- runif(length(x2) - sum(x2), min = 0, max = x2threshold) 
+
+# Use the randomly generated parameters to produce random draws from the 
+# binomial distributions by cluster
+x1_ij <- vector(length = N) # initialize 
+for(i in seq_along(1:n_clusters)) {
+  x1_ij[cluster==i] <- rbinom(cluster_size, 1, p_j[i])
+}
+
+# Compute cluster means based on the generated data 
+x1_cm_j <- rep(as.vector(tapply(x1_ij, cluster, mean)), cluster_size)
+
+# Compute cluster-mean-centered variable
+x1_cmc_ij <- x1_ij - x1_cm_j
+
+# Generate the random components
+e_ij <- rnorm(N, mean = 0, sigma2) 
+covar_matrix <- matrix(c(tau0sq, tau01, tau01, tau1sq), ncol = 2)
+random_comp <- MASS::mvrnorm(n = N, mu = c(0, 0), Sigma = covar_matrix)
+u_0j <- random_comp[, 1]; u_1j <- random_comp[, 2]
+
+# Compute betas
+beta_0j <- gamma00 + gamma01 * x1_cm_j + u_0j
+beta_1j <- gamma10 + u_1j
+
+# Compute y based on formula
+y <- beta_0j + beta_1j * x1_ij + e_ij
+
+dat <- data.frame("y" = y, "cluster" = cluster,
+                  "x1_ij" = x1_ij, "x1_cm_j" = x1_cm_j, 
+                  "x1_cmc_ij" = x1_cmc_ij)
+return(dat)
+}
+```
+
+
+```{r between-within-function-one-var}
+# Function to generate a data set with the between-within formulation, single 
+# binary predictor
+generate_bw_data_single_var <- function(n_clusters, cluster_size, 
+                                        gamma00, gamma01, gamma10, 
+                                        tau0sq, tau1sq, tau01, sigma2,
+                                        x2threshold, x2prob) {
+  
+N <- cluster_size * n_clusters # total number of observations 
+cluster <- rep(c(1:n_clusters), cluster_size) # assign observations to clusters
+
+# Randomly generate the probabilities that will be used to generate x2_ij:
+x2 <- rbinom(n_clusters, 1, x2prob) # assign clusters to membership 1 vs. 0 (x2)
+p_j <- vector(length = n_clusters) # initialize
+p_j[x2 == 1] <- runif(sum(x2), min = x2threshold, max = 1) # generate p_j based on x2
+p_j[x2 == 0] <- runif(length(x2) - sum(x2), min = 0, max = x2threshold) 
+
+# Use the randomly generated parameters to produce random draws from the 
+# binomial distributions by cluster
+x1_ij <-  vector(length = N) # initialize 
+for(i in seq_along(1:n_clusters)) {
+ x1_ij[cluster==i] <- rbinom(cluster_size, 1, p_j[i])
+}
+
+# Compute cluster means based on the generated data 
+x1_cm_j <- rep(as.vector(tapply(x1_ij, cluster, mean)), cluster_size)
+
+# Compute cluster-mean-centered variables
+x1_cmc_ij <- x1_ij - x1_cm_j
+
+# Generate the random components
+e_ij <- rnorm(N, mean = 0, sigma2) 
+covar_matrix <- matrix(c(tau0sq, tau01, tau01, tau1sq), ncol = 2)
+random_comp <- MASS::mvrnorm(n = N, mu = c(0, 0), Sigma = covar_matrix)
+u_0j <- random_comp[, 1]; u_1j <- random_comp[, 2]
+
+# Compute betas
+beta_0j <- gamma00 + gamma01 * x1_cm_j + u_0j
+beta_1j <- gamma10 + u_1j
+
+# Compute y based on formula
+y <- beta_0j + beta_1j * x1_cmc_ij + e_ij
+
+dat <- data.frame("y" = y, "cluster" = cluster,
+                  "x1_ij" = x1_ij, "x1_cm_j" = x1_cm_j, 
+                  "x1_cmc_ij" = x1_cmc_ij)
+return(dat)
+}
+```
+
+```{r message=FALSE, warning=FALSE}
+# Function that runs niter simulations, generating a two data sets in each
+# iteration: one with DGM=contextual, one with DGM=between-within. For a subset
+# of each data set (of size = size_subset), fits the contextual model and the
+# between model (FM = C, FM=BW). Extracts deviance for each FM from the anova 
+# output comparing the models. Computes ICC for each fitted model. Returns 
+# the deviance values for the BW data set and the C data set as well as the 
+# ICC for each model fit to the two data sets.
+dev_func <- function(n_clusters, cluster_size, gamma00, gamma01, gamma10, 
+                     tau0sq, tau1sq, tau01, sigma2, 
+                     x2threshold, x2prob,
+                     niter, size_subset) {
+  # tic()  ## uncomment for counter
+   sim_dev_bw <- sim_dev_c <- sim_AIC_bw <- sim_AIC_c <-
+      as.data.frame(matrix(nrow = niter, ncol = 2))
+   sim_icc <- as.data.frame(matrix(nrow = niter, ncol = 4))
+   sim_bw_subset <- sim_c_subset <- sim_bw <- sim_c <- anova_sim_bw <- 
+      anova_sim_c <-vector(mode = "list", 1)
+   
+ for(i in seq_along(1:niter)){
+  # progress(i, niter)
+   
+    # Simulate a data set with the between-within formulation (DGM=BW)
+  sim_bw <- generate_bw_data_single_var(n_clusters, cluster_size, gamma00,
+                                        gamma01, gamma10,
+                                        tau0sq, tau1sq, tau01, sigma2,
+                                        x2threshold, x2prob)
+  # select a subset of the simulated data
+  random_clusters_bw <- sample(unique(sim_bw$cluster), size = size_subset)
+  sim_bw_subset <- sim_bw %>%
+    filter(cluster %in% random_clusters_bw)
+  # delete the simulated data to free up memory
+  rm(sim_bw); rm(random_clusters_bw); gc()
+ 
+  # Simulate a data set with contextual formulation (DGM=C)
+  sim_c <- generate_c_data_single_var(n_clusters, cluster_size, gamma00,
+                                        gamma01, gamma10,
+                                        tau0sq, tau1sq, tau01, sigma2,
+                                        x2threshold, x2prob)
+
+  random_clusters_c <- sample(unique(sim_c$cluster), size = size_subset)
+  sim_c_subset <- sim_c %>%
+    filter(cluster %in% random_clusters_c)
+  rm(sim_c); rm(random_clusters_c); gc()
+  
+  # Fit the models to data
+  # DGM=BW, FM=BW
+  sim_bw_sub_fit_bw <-  lmer(y ~ x1_cmc_ij + x1_cm_j + (x1_cmc_ij | cluster),
+                                       REML = FALSE, data = sim_bw_subset)
+  # DGM=BW, FM=C
+  sim_bw_sub_fit_c <- lmer(y ~ x1_ij + x1_cm_j + (x1_ij | cluster), REML = FALSE,
+                                     data = sim_bw_subset)
+  # DGM=C, FM=BW
+  sim_c_sub_fit_bw <- lmer(y ~  x1_cmc_ij + x1_cm_j + (x1_cmc_ij | cluster),
+                                   REML = FALSE, data = sim_c_subset)
+  # DGM=C, FM=C
+  sim_c_sub_fit_c <- lmer(y ~  x1_ij + x1_cm_j + (x1_ij | cluster), 
+                          REML = FALSE, data = sim_c_subset)
+ 
+  # ANOVA for model comparison
+  anova_sim_bw <- anova(sim_bw_sub_fit_bw, sim_bw_sub_fit_c)
+  anova_sim_c <- anova(sim_c_sub_fit_bw, sim_c_sub_fit_c)
+  # Extract and store deviance
+  sim_dev_bw[i,] <- anova_sim_bw$deviance
+  sim_dev_c[i,] <- anova_sim_c$deviance
+  
+  # Compute ICC
+  sim_icc[i,1] <- get_icc(sim_bw_sub_fit_bw)
+  sim_icc[i,2] <- get_icc(sim_bw_sub_fit_c)
+  sim_icc[i,3] <- get_icc(sim_c_sub_fit_c)
+  sim_icc[i,4] <- get_icc(sim_c_sub_fit_bw)
+ 
+  }
+  names(sim_dev_c) <-names(sim_dev_bw) <- c("dev_bw", "dev_c")
+  names(sim_icc) <- c("bw_bw", "bw_c", "c_c", "c_bw")
+  
+  ##toc()
+  return(list("sim_dev_bw"= sim_dev_bw,
+              "sim_dev_c"= sim_dev_c,
+              "ICC" = sim_icc))
+}  
+```
+
+
+## Examples 
+```{r contextual-ex1_one}
+# Example code 
+contextual_ex1<- generate_c_data_single_var(n_clusters = 1000, 
+                                            cluster_size = 100,
+                            gamma00 = 10, gamma01 = 1, gamma10 = 5,
+                            tau0sq = 0.5, tau1sq = 3.5, tau01 = 0, sigma2 = 1,
+                            x2threshold = 0.40, x2prob = 0.28) 
+(contextual_ex1 %>% arrange(cluster))[1:6, ] # print head
+(contextual_ex1 %>% arrange(cluster))[395:400, ] # print tail
+```
+
+```{r between_within-ex1-one}
+# Example code 
+between_within_ex1_one<- generate_bw_data_single_var(
+                                    n_clusters = 1000, cluster_size = 100,
+                                    gamma00 = 10, gamma01 = 1, gamma10 = 5, 
+                                    tau0sq = 0.5, tau1sq = 3.5, tau01 = 0, 
+                                    sigma2 = 1,
+                                    x2threshold = 0.40, x2prob = 0.28) 
+(between_within_ex1_one %>% arrange(cluster))[1:6, ] # print head
+(between_within_ex1_one %>% arrange(cluster))[395:400, ] # print tail
+```
+
+# Simulations
+
+## $N=10$, $n_j = 50$, $\tau_1^2 \in\{1, 5, 10\}$, $\tau_0^2 = 0.1$, $\tau_{01}=0$
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case1 <- suppressMessages(dev_func(n_clusters = 100, 
+                                        cluster_size = 50,
+                                        size_subset = 10, 
+                                        niter = 1000,
+                                        gamma00 = 10, 
+                                        gamma01 = 1, 
+                                        gamma10 = 5, 
+                                        tau0sq = 0.1, 
+                                        tau1sq = 1, 
+                                        tau01 = 0, 
+                                        sigma2 = 1,
+                                        x2threshold = 0.40, 
+                                        x2prob = 0.20))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case1$sim_dev_bw, tau_case1$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case2 <- suppressMessages(dev_func(n_clusters = 100, 
+                                      cluster_size = 50,
+                                      size_subset = 10,
+                                      gamma00 = 10, 
+                                      gamma01 = 1, 
+                                      gamma10 = 5, 
+                                      tau0sq = 0.1, 
+                                      tau1sq = 5, 
+                                      tau01 = 0, 
+                                      sigma2 = 1,
+                                      x2threshold = 0.40, 
+                                      x2prob = 0.20,
+                                      niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case2$sim_dev_bw, tau_case2$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case3 <- suppressMessages(dev_func(n_clusters = 100, 
+                                     cluster_size = 50,
+                                     size_subset = 10,
+                                     gamma00 = 10, 
+                                     gamma01 = 1, 
+                                     gamma10 = 5, 
+                                     tau0sq = 0.1, 
+                                     tau1sq = 10, 
+                                     tau01 = 0, 
+                                     sigma2 = 1,
+                                     x2threshold = 0.40, 
+                                     x2prob = 0.20,
+                                     niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case3$sim_dev_bw, tau_case3$sim_dev_c, niter=1000)
+```
+
+##$N=10$, $n_j = 50$, $\tau_1^2 \in\{1, 5, 10\}$, $\tau_0^2 = 1$, $\tau_{01}=0$
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+#tau0sq=1 tau1sq1
+tau_case4 <- suppressMessages(dev_func(n_clusters = 100, 
+                                 cluster_size = 50,
+                                 size_subset = 10,
+                                 gamma00 = 10, 
+                                 gamma01 = 1, 
+                                 gamma10 = 5, 
+                                 tau0sq = 1, 
+                                 tau1sq = 1, 
+                                 tau01 = 0, 
+                                 sigma2 = 1,
+                                 x2threshold = 0.40, 
+                                 x2prob = 0.20,
+                                 niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case4$sim_dev_bw, tau_case4$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+#tau0sq=1 tau1sq 5
+set.seed(789)
+tau_case5 <- suppressMessages(dev_func(n_clusters = 100, 
+                                 cluster_size = 50,
+                                 size_subset = 10,
+                                 gamma00 = 10, 
+                                 gamma01 = 1, 
+                                 gamma10 = 5, 
+                                 tau0sq = 1, 
+                                 tau1sq = 5, 
+                                 tau01 = 0, 
+                                 sigma2 = 1,
+                                 x2threshold = 0.40, 
+                                 x2prob = 0.20,
+                                 niter = 1000))
+```
+
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case5$sim_dev_bw, tau_case5$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+#tau0sq=1 tau1sq 10
+set.seed(789)
+tau_case6<- suppressMessages(dev_func(n_clusters = 100, 
+                                 cluster_size = 50,
+                                 size_subset = 10,
+                                 gamma00 = 10, 
+                                 gamma01 = 1, 
+                                 gamma10 = 5, 
+                                 tau0sq = 1, 
+                                 tau1sq = 10, 
+                                 tau01 = 0, 
+                                 sigma2 = 1,
+                                 x2threshold = 0.40, 
+                                 x2prob = 0.20,
+                                 niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case6$sim_dev_bw, tau_case6$sim_dev_c, niter=1000)
+```
+
+
+## $N=10$, $n_j = 50$, $\tau_1^2 \in\{1, 5, 10\}$, $\tau_0^2 = 1, \tau_{01}=0.5$$
+
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+#tau0sq=1 tau1sq1
+tau_case7 <- suppressMessages(dev_func(n_clusters = 100, 
+                                 cluster_size = 50,
+                                 size_subset = 10,
+                                 gamma00 = 10, 
+                                 gamma01 = 1, 
+                                 gamma10 = 5, 
+                                 tau0sq = 1, 
+                                 tau1sq = 1, 
+                                 tau01 = 0.5, 
+                                 sigma2 = 1,
+                                 x2threshold = 0.40, 
+                                 x2prob = 0.20,
+                                 niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case7$sim_dev_bw, tau_case7$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+#tau0sq=1 tau1sq 5
+set.seed(789)
+tau_case8 <- suppressMessages(dev_func(n_clusters = 100, 
+                                 cluster_size = 50,
+                                 size_subset = 10,
+                                 gamma00 = 10, 
+                                 gamma01 = 1, 
+                                 gamma10 = 5, 
+                                 tau0sq = 1, 
+                                 tau1sq = 5, 
+                                 tau01 = 0.5, 
+                                 sigma2 = 1,
+                                 x2threshold = 0.40, 
+                                 x2prob = 0.20,
+                                 niter = 1000))
+```
+
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case8$sim_dev_bw, tau_case8$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+#tau0sq=1 tau1sq 10
+set.seed(789)
+tau_case9 <- suppressMessages(dev_func(n_clusters = 100, 
+                                 cluster_size = 50,
+                                 size_subset = 10,
+                                 gamma00 = 10, 
+                                 gamma01 = 1, 
+                                 gamma10 = 5, 
+                                 tau0sq = 1, 
+                                 tau1sq = 10, 
+                                 tau01 = 0.5, 
+                                 sigma2 = 1,
+                                 x2threshold = 0.40, 
+                                 x2prob = 0.20,
+                                 niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case9$sim_dev_bw, tau_case9$sim_dev_c, niter=1000)
+```
+
+
+## $N=10$,$n_j = 50$, $\tau_0^2, \tau_1^2 \in\{(0.01,1), (0.1,10), (1, 100), (0.1,1), (1,10), (10,100) \}$, $\tau_{01}=0$
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case10 <- suppressMessages(dev_func(n_clusters = 100, 
+                                     cluster_size = 50,
+                                     size_subset = 10,
+                                     gamma00 = 10, 
+                                     gamma01 = 1, 
+                                     gamma10 = 5, 
+                                     tau0sq = 0.01, 
+                                     tau1sq = 1, 
+                                     tau01 = 0, 
+                                     sigma2 = 1,
+                                     x2threshold = 0.40,
+                                     x2prob = 0.20,
+                                     niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case10$sim_dev_bw, tau_case10$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case11 <- suppressMessages(dev_func(n_clusters = 100, 
+                                     cluster_size = 50,
+                                     size_subset = 10,
+                                     gamma00 = 10, 
+                                     gamma01 = 1, 
+                                     gamma10 = 5, 
+                                     tau0sq = 0.1, 
+                                     tau1sq = 10, 
+                                     tau01 = 0, 
+                                     sigma2 = 1,
+                                     x2threshold = 0.40,
+                                     x2prob = 0.20,
+                                     niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case11$sim_dev_bw, tau_case11$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case12 <- suppressMessages(dev_func(n_clusters = 100, 
+                                     cluster_size = 50,
+                                     size_subset = 10,
+                                     gamma00 = 10, 
+                                     gamma01 = 1, 
+                                     gamma10 = 5, 
+                                     tau0sq = 1, 
+                                     tau1sq = 100, 
+                                     tau01 = 0, 
+                                     sigma2 = 1,
+                                     x2threshold = 0.40,
+                                     x2prob = 0.20,
+                                     niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case12$sim_dev_bw, tau_case12$sim_dev_c, niter=1000)
+```
+
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case13 <- suppressMessages(dev_func(n_clusters = 100, 
+                                     cluster_size = 50,
+                                     size_subset = 10,
+                                     gamma00 = 10, 
+                                     gamma01 = 1, 
+                                     gamma10 = 5, 
+                                     tau0sq = 0.1, 
+                                     tau1sq = 1, 
+                                     tau01 = 0, 
+                                     sigma2 = 1,
+                                     x2threshold = 0.40,
+                                     x2prob = 0.20,
+                                     niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case13$sim_dev_bw, tau_case13$sim_dev_c, niter=1000)
+```
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case14 <- suppressMessages(dev_func(n_clusters = 100, 
+                                     cluster_size = 50,
+                                     size_subset = 10,
+                                     gamma00 = 10, 
+                                     gamma01 = 1, 
+                                     gamma10 = 5, 
+                                     tau0sq = 1, 
+                                     tau1sq = 10, 
+                                     tau01 = 0, 
+                                     sigma2 = 1,
+                                     x2threshold = 0.40,
+                                     x2prob = 0.20,
+                                     niter = 1000))
+```
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case14$sim_dev_bw, tau_case14$sim_dev_c, niter=1000)
+```
+```{r message=FALSE, warning=FALSE}
+set.seed(789)
+tau_case15 <- suppressMessages(dev_func(n_clusters = 100, 
+                                     cluster_size = 50,
+                                     size_subset = 10,
+                                     gamma00 = 10, 
+                                     gamma01 = 1, 
+                                     gamma10 = 5, 
+                                     tau0sq = 10, 
+                                     tau1sq = 100, 
+                                     tau01 = 0, 
+                                     sigma2 = 1,
+                                     x2threshold = 0.40,
+                                     x2prob = 0.20,
+                                     niter = 1000))
+```
+
+```{r message=FALSE, warning=FALSE}
+prop_dev(tau_case15$sim_dev_bw, tau_case15$sim_dev_c, niter=1000)
+```
+
+### ICC
+
+```{r message=FALSE, warning=FALSE}
+      colMeans(tau_case1$ICC, na.rm = TRUE)
+      colMeans(tau_case2$ICC, na.rm = TRUE)
+      colMeans(tau_case3$ICC, na.rm = TRUE)
+      colMeans(tau_case4$ICC, na.rm = TRUE)
+      colMeans(tau_case5$ICC, na.rm = TRUE)
+      colMeans(tau_case6$ICC, na.rm = TRUE)
+      colMeans(tau_case7$ICC, na.rm = TRUE)
+      colMeans(tau_case8$ICC, na.rm = TRUE)
+      colMeans(tau_case9$ICC, na.rm = TRUE)
+      colMeans(tau_case10$ICC, na.rm = TRUE)
+      colMeans(tau_case11$ICC, na.rm = TRUE)
+      colMeans(tau_case12$ICC, na.rm = TRUE)
+      colMeans(tau_case13$ICC, na.rm = TRUE)
+      colMeans(tau_case14$ICC, na.rm = TRUE)
+      colMeans(tau_case15$ICC, na.rm = TRUE)
+```
+
