@@ -1,1 +1,1 @@
-Repository for R files/datasets/other supplementary material for PSYC575 research project
+Repository for R files/datasets/other supplementary material for PSYC575 Multi-level Modeling research project
